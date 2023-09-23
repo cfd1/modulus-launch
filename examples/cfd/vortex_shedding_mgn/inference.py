@@ -12,28 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch, dgl
-from dgl.dataloading import GraphDataLoader
-import torch
+import os
+
 import matplotlib.pyplot as plt
-import numpy as np
+import torch
+from dgl.dataloading import GraphDataLoader
 from matplotlib import animation
 from matplotlib import tri as mtri
-import os
 from matplotlib.patches import Rectangle
-
-from modulus.models.meshgraphnet import MeshGraphNet
 from modulus.datapipes.gnn.vortex_shedding_dataset import VortexSheddingDataset
+from modulus.models.meshgraphnet import MeshGraphNet
+
+from constants import Constants
 from modulus.launch.logging import PythonLogger
 from modulus.launch.utils import load_checkpoint
-from constants import Constants
 
 # Instantiate constants
 C = Constants()
 
 
 class MGNRollout:
-    def __init__(self, logger):
+    def __init__(self, logger, config):
+        self.config = config
         # set device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using {self.device} device")
@@ -41,10 +41,10 @@ class MGNRollout:
         # instantiate dataset
         self.dataset = VortexSheddingDataset(
             name="vortex_shedding_test",
-            data_dir=C.data_dir,
+            data_dir=config.data_dir,
             split="test",
-            num_samples=C.num_test_samples,
-            num_steps=C.num_test_time_steps,
+            num_samples=config.num_test_samples,
+            num_steps=config.num_test_time_steps,
         )
 
         # instantiate dataloader
@@ -57,19 +57,38 @@ class MGNRollout:
 
         # instantiate the model
         self.model = MeshGraphNet(
-            C.num_input_features, C.num_edge_features, C.num_output_features
+            input_dim_nodes=config.num_input_features,
+            input_dim_edges=config.num_edge_features,
+            output_dim=config.num_output_features,
+            processor_size=config.processor_size,
+            num_layers_node_processor=config.num_layers_node_processor,
+            num_layers_edge_processor=config.num_layers_edge_processor,
+            hidden_dim_processor=config.hidden_dim_processor,
+            hidden_dim_node_encoder=config.hidden_dim_node_encoder,
+            num_layers_node_encoder=config.num_layers_node_encoder,
+            hidden_dim_edge_encoder=config.hidden_dim_edge_encoder,
+            num_layers_edge_encoder=config.num_layers_edge_encoder,
+            hidden_dim_node_decoder=config.hidden_dim_node_decoder,
+            num_layers_node_decoder=config.num_layers_node_decoder,
+            aggregation=config.aggregation,
+            do_concat_trick=config.do_concat_trick,
+            num_processor_checkpoint_segments=config.num_processor_checkpoint_segments,
+            activation_fn=config.activation_fn,
         )
-        if C.jit:
+        if config.jit:
             self.model = torch.jit.script(self.model).to(self.device)
         else:
             self.model = self.model.to(self.device)
+
+        # instantiate loss
+        self.criterion = torch.nn.MSELoss()
 
         # enable train mode
         self.model.eval()
 
         # load checkpoint
         _ = load_checkpoint(
-            os.path.join(C.ckpt_path, C.ckpt_name),
+            path=os.path.join(config.ckpt_path, config.ckpt_name),
             models=self.model,
             device=self.device,
         )
@@ -77,12 +96,13 @@ class MGNRollout:
         self.var_identifier = {"u": 0, "v": 1, "p": 2}
 
     def predict(self):
-        self.pred, self.exact, self.faces, self.graphs = [], [], [], []
+        self.pred, self.exact, self.faces, self.graphs, self.loss = [], [], [], [], []
         stats = {
             key: value.to(self.device) for key, value in self.dataset.node_stats.items()
         }
         for i, (graph, cells, mask) in enumerate(self.dataloader):
             graph = graph.to(self.device)
+
             # denormalize data
             graph.ndata["x"][:, 0:2] = self.dataset.denormalize(
                 graph.ndata["x"][:, 0:2], stats["velocity_mean"], stats["velocity_std"]
@@ -101,12 +121,14 @@ class MGNRollout:
             # inference step
             invar = graph.ndata["x"].clone()
 
-            if i % (C.num_test_time_steps - 1) != 0:
+            if i % (self.config.num_test_time_steps - 1) != 0:
                 invar[:, 0:2] = self.pred[i - 1][:, 0:2].clone()
                 i += 1
             invar[:, 0:2] = self.dataset.normalize_node(
                 invar[:, 0:2], stats["velocity_mean"], stats["velocity_std"]
             )
+
+            # Get the predition
             pred_i = self.model(invar, graph.edata["x"], graph).detach()  # predict
 
             # denormalize prediction
@@ -116,97 +138,182 @@ class MGNRollout:
             pred_i[:, 2] = self.dataset.denormalize(
                 pred_i[:, 2], stats["pressure_mean"], stats["pressure_std"]
             )
+
+            loss = self.criterion(pred_i, graph.ndata["y"])
+            self.loss.append(loss.cpu().detach())
+
             invar[:, 0:2] = self.dataset.denormalize(
                 invar[:, 0:2], stats["velocity_mean"], stats["velocity_std"]
             )
 
             # do not update the "wall_boundary" & "outflow" nodes
             mask = torch.cat((mask, mask), dim=-1).to(self.device)
-            pred_i[:, 0:2] = torch.where(
-                mask, pred_i[:, 0:2], torch.zeros_like(pred_i[:, 0:2])
-            )
+            pred_i[:, 0:2] = torch.where(mask, pred_i[:, 0:2], torch.zeros_like(pred_i[:, 0:2]))
 
             # integration
-            self.pred.append(
-                torch.cat(
-                    ((pred_i[:, 0:2] + invar[:, 0:2]), pred_i[:, [2]]), dim=-1
-                ).cpu()
-            )
+            self.pred.append(torch.cat(((pred_i[:, 0:2] + invar[:, 0:2]), pred_i[:, [2]]), dim=-1).cpu())
             self.exact.append(
-                torch.cat(
-                    (
-                        (graph.ndata["y"][:, 0:2] + graph.ndata["x"][:, 0:2]),
-                        graph.ndata["y"][:, [2]],
-                    ),
-                    dim=-1,
-                ).cpu()
-            )
+                torch.cat(((graph.ndata["y"][:, 0:2] + graph.ndata["x"][:, 0:2]), graph.ndata["y"][:, [2]],),
+                          dim=-1, ).cpu())
 
             self.faces.append(torch.squeeze(cells).numpy())
             self.graphs.append(graph.cpu())
 
     def init_animation(self, idx):
+        self.animation_variable = C.viz_vars[idx]
         self.pred_i = [var[:, idx] for var in self.pred]
         self.exact_i = [var[:, idx] for var in self.exact]
 
         # fig configs
         plt.rcParams["image.cmap"] = "inferno"
-        self.fig, self.ax = plt.subplots(2, 1, figsize=(16, 9))
+        self.fig, self.ax = plt.subplots(3, 1, figsize=(16, (9 / 2) * 3))
 
         # Set background color to black
         self.fig.set_facecolor("black")
         self.ax[0].set_facecolor("black")
         self.ax[1].set_facecolor("black")
+        self.ax[2].set_facecolor("black")
+        self.first_call = True
 
         # make animations dir
         if not os.path.exists("./animations"):
             os.makedirs("./animations")
 
     def animate(self, num):
-        num *= C.frame_skip
+        if self.animation_variable == "u":
+            min_var = -1.0
+            max_var = 4.5
+            min_delta_var = -0.25
+            max_delta_var = 0.25
+        elif self.animation_variable == "v":
+            min_var = -2.0
+            max_var = 2.0
+            min_delta_var = -0.25
+            max_delta_var = 0.25
+        elif self.animation_variable == "p":
+            min_var = -6.0
+            max_var = 6.0
+            min_delta_var = -0.25
+            max_delta_var = 0.25
+
+        num *= self.config.frame_skip
         graph = self.graphs[num]
         y_star = self.pred_i[num].numpy()
         y_exact = self.exact_i[num].numpy()
+        y_error = y_star - y_exact
         triang = mtri.Triangulation(
             graph.ndata["mesh_pos"][:, 0].numpy(),
             graph.ndata["mesh_pos"][:, 1].numpy(),
             self.faces[num],
         )
+
+        # Prediction plotting
         self.ax[0].cla()
         self.ax[0].set_aspect("equal")
         self.ax[0].set_axis_off()
         navy_box = Rectangle((0, 0), 1.4, 0.4, facecolor="navy")
         self.ax[0].add_patch(navy_box)  # Add a navy box to the first subplot
-        self.ax[0].tripcolor(triang, y_star, vmin=np.min(y_star), vmax=np.max(y_star))
+        ans = self.ax[0].tripcolor(triang, y_star, vmin=min_var, vmax=max_var)
         self.ax[0].triplot(triang, "ko-", ms=0.5, lw=0.3)
         self.ax[0].set_title("Modulus MeshGraphNet Prediction", color="white")
+        if num == 0 and self.first_call:
+            cb_ax = self.fig.add_axes([.9525, .69, .01, .26])
+            cb = self.fig.colorbar(ans, orientation='vertical', cax=cb_ax)
+            # cb = self.fig.colorbar(ans, ax=self.ax[0], location="right")
+            # COLORBAR
+            # set colorbar label plus label color
+            cb.set_label(self.animation_variable, color="white")
+
+            # set colorbar tick color
+            cb.ax.yaxis.set_tick_params(color="white")
+
+            # set colorbar edgecolor
+            cb.outline.set_edgecolor("white")
+
+            # set colorbar ticklabels
+            plt.setp(plt.getp(cb.ax.axes, 'yticklabels'), color="white")
+
+        # Truth plotting
         self.ax[1].cla()
         self.ax[1].set_aspect("equal")
         self.ax[1].set_axis_off()
         navy_box = Rectangle((0, 0), 1.4, 0.4, facecolor="navy")
         self.ax[1].add_patch(navy_box)  # Add a navy box to the second subplot
-        self.ax[1].tripcolor(
-            triang, y_exact, vmin=np.min(y_exact), vmax=np.max(y_exact)
-        )
+        ans = self.ax[1].tripcolor(triang, y_exact, vmin=min_var, vmax=max_var)
         self.ax[1].triplot(triang, "ko-", ms=0.5, lw=0.3)
         self.ax[1].set_title("Ground Truth", color="white")
+        if num == 0 and self.first_call:
+            cb_ax = self.fig.add_axes([.9525, .37, .01, .26])
+            cb = self.fig.colorbar(ans, orientation='vertical', cax=cb_ax)
+            # cb = self.fig.colorbar(ans, ax=self.ax[0], location="right")
+            # COLORBAR
+            # set colorbar label plus label color
+            cb.set_label(self.animation_variable, color="white")
+
+            # set colorbar tick color
+            cb.ax.yaxis.set_tick_params(color="white")
+
+            # set colorbar edgecolor
+            cb.outline.set_edgecolor("white")
+
+            # set colorbar ticklabels
+            plt.setp(plt.getp(cb.ax.axes, 'yticklabels'), color="white")
+
+        # Error plotting
+        self.ax[2].cla()
+        self.ax[2].set_aspect("equal")
+        self.ax[2].set_axis_off()
+        navy_box = Rectangle((0, 0), 1.4, 0.4, facecolor="navy")
+        self.ax[2].add_patch(navy_box)  # Add a navy box to the second subplot
+        ans = self.ax[2].tripcolor(triang, y_error, vmin=min_delta_var, vmax=max_delta_var, cmap="coolwarm")
+        self.ax[2].triplot(triang, "ko-", ms=0.5, lw=0.3)
+        self.ax[2].set_title("Absolute Error (Prediction - Ground Truth)", color="white")
+        if num == 0 and self.first_call:
+            cb_ax = self.fig.add_axes([.9525, .055, .01, .26])
+            cb = self.fig.colorbar(ans, orientation='vertical', cax=cb_ax)
+            # cb = self.fig.colorbar(ans, ax=self.ax[0], location="right")
+            # COLORBAR
+            # set colorbar label plus label color
+            cb.set_label(self.animation_variable, color="white")
+
+            # set colorbar tick color
+            cb.ax.yaxis.set_tick_params(color="white")
+
+            # set colorbar edgecolor
+            cb.outline.set_edgecolor("white")
+
+            # set colorbar ticklabels
+            plt.setp(plt.getp(cb.ax.axes, 'yticklabels'), color="white")
 
         # Adjust subplots to minimize empty space
         self.ax[0].set_aspect("auto", adjustable="box")
-        self.ax[1].set_aspect("auto", adjustable="box")
         self.ax[0].autoscale(enable=True, tight=True)
+
+        self.ax[1].set_aspect("auto", adjustable="box")
         self.ax[1].autoscale(enable=True, tight=True)
+
+        self.ax[2].set_aspect("auto", adjustable="box")
+        self.ax[2].autoscale(enable=True, tight=True)
+
         self.fig.subplots_adjust(
             left=0.05, bottom=0.05, right=0.95, top=0.95, wspace=0.1, hspace=0.2
         )
         return self.fig
 
 
+def setup_config(wandb_config={}):
+    constant = Constants(**wandb_config)
+
+    return constant
+
+
 if __name__ == "__main__":
+    C = setup_config()
+
     logger = PythonLogger("main")  # General python logger
     logger.file_logging()
     logger.info("Rollout started...")
-    rollout = MGNRollout(logger)
+    rollout = MGNRollout(logger, config=C)
     idx = [rollout.var_identifier[k] for k in C.viz_vars]
     rollout.predict()
     for i in idx:
@@ -215,7 +322,11 @@ if __name__ == "__main__":
             rollout.fig,
             rollout.animate,
             frames=len(rollout.graphs) // C.frame_skip,
-            interval=C.frame_interval,
+            interval=C.frame_interval
         )
         ani.save("animations/animation_" + C.viz_vars[i] + ".gif")
         logger.info(f"Created animation for {C.viz_vars[i]}")
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 4.5))
+    ax.plot(rollout.loss)
+    plt.savefig("animations/loss.png")

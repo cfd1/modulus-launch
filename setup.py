@@ -14,4 +14,6 @@
 
 from setuptools import setup
 
-setup()
+setup(
+    version="0.3.0a0"
+)
