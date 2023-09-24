@@ -43,7 +43,7 @@ class Constants(BaseModel):
 
     lr: float = 0.0001
     lr_decay_rate: float = 0.9999991
-    ckpt_path: str = "/workspace/checkpoints_training_5"
+    ckpt_path: str = "/workspace/checkpoints_training_6"
     ckpt_name: str = "model.pt"
 
     # Mesh Graph Net Setup
