@@ -16,7 +16,7 @@ import argparse
 import os
 import time
 from typing import Optional, Any
-
+from tqdm import tqdm, trange
 import torch
 from dgl.dataloading import GraphDataLoader
 from torch.cuda.amp import autocast, GradScaler
@@ -55,7 +55,7 @@ class MGNTrainer:
             split="train",
             num_samples=config.num_training_samples,
             num_steps=config.num_training_time_steps,
-            noise_std=config.noise_std,
+            noise_std=config.training_noise_std,
             force_reload=False,
             verbose=False,
         )
@@ -63,7 +63,7 @@ class MGNTrainer:
         # instantiate dataloader
         self.dataloader = GraphDataLoader(
             dataset,
-            batch_size=config.batch_size,
+            batch_size=config.training_batch_size,
             shuffle=True,
             drop_last=True,
             pin_memory=True,
@@ -72,46 +72,22 @@ class MGNTrainer:
 
         # instantiate validation dataset
         rank_zero_logger.info("Loading the validation dataset...")
-        valid_dataset = VortexSheddingDataset(
+        self.valid_dataset = VortexSheddingDataset(
             name="vortex_shedding_valid",
             data_dir=config.data_dir,
             split="valid",
             num_samples=config.num_valid_samples,
             num_steps=config.num_valid_time_steps,
-            noise_std=config.noise_std,
             force_reload=False,
             verbose=False,
         )
 
         # instantiate validation dataloader
         self.valid_dataloader = GraphDataLoader(
-            valid_dataset,
-            batch_size=config.batch_size,
+            self.valid_dataset,
+            batch_size=config.valid_batch_size,
             shuffle=False,
-            drop_last=True,
-            pin_memory=True,
-            use_ddp=False,
-        )
-
-        # instantiate test dataset
-        rank_zero_logger.info("Loading the test dataset...")
-        test_dataset = VortexSheddingDataset(
-            name="vortex_shedding_test",
-            data_dir=config.data_dir,
-            split="test",
-            num_samples=config.num_test_samples,
-            num_steps=config.num_test_time_steps,
-            noise_std=config.noise_std,
-            force_reload=False,
-            verbose=False,
-        )
-
-        # instantiate test dataloader
-        self.test_dataloader = GraphDataLoader(
-            test_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            drop_last=True,
+            drop_last=False,
             pin_memory=True,
             use_ddp=False,
         )
@@ -210,20 +186,75 @@ class MGNTrainer:
         for param_group in self.optimizer.param_groups:
             return param_group["lr"]
 
-    # @torch.no_grad()
-    # def validation(self):
-    #     # enable train mode
-    #     self.model.eval()
-    #     error = 0
-    #     for graph in self.validation_dataloader:
-    #         graph = graph.to(self.dist.device)
-    #         pred = self.model(graph.ndata["x"], graph.edata["x"], graph)
-    #         gt = graph.ndata["y"]
-    #         error += relative_lp_error(pred, gt)
-    #     error = error / len(self.validation_dataloader)
-    #     self.wb.log({"val_error (%)": error})
-    #     self.rank_zero_logger.info(f"Validation error (%): {error}")
+    @torch.no_grad()
+    def validation(self):
+        # enable eval mode
+        self.model.eval()
 
+        self.pred = []
+        stats = {
+            key: value.to(self.dist.device) for key, value in self.valid_dataset.node_stats.items()
+        }
+        loss_valid_agg = 0
+        for i, (graph, cells, mask) in enumerate(self.valid_dataloader):
+            graph = graph.to(self.dist.device)
+
+            # denormalize data
+            graph.ndata["x"][:, 0:2] = self.valid_dataset.denormalize(
+                graph.ndata["x"][:, 0:2], stats["velocity_mean"], stats["velocity_std"]
+            )
+            graph.ndata["y"][:, 0:2] = self.valid_dataset.denormalize(
+                graph.ndata["y"][:, 0:2],
+                stats["velocity_diff_mean"],
+                stats["velocity_diff_std"],
+            )
+            graph.ndata["y"][:, [2]] = self.valid_dataset.denormalize(
+                graph.ndata["y"][:, [2]],
+                stats["pressure_mean"],
+                stats["pressure_std"],
+            )
+
+            # inference step
+            invar = graph.ndata["x"].clone()
+
+            if i % (self.config.num_valid_time_steps - 1) != 0:
+                invar[:, 0:2] = self.pred[i - 1][:, 0:2].clone()
+                i += 1
+            invar[:, 0:2] = self.valid_dataset.normalize_node(
+                invar[:, 0:2], stats["velocity_mean"], stats["velocity_std"]
+            )
+
+            # Get the prediction
+            pred_i = self.model(invar, graph.edata["x"], graph).detach()  # predict
+
+            # denormalize prediction
+            pred_i[:, 0:2] = self.valid_dataset.denormalize(
+                pred_i[:, 0:2], stats["velocity_diff_mean"], stats["velocity_diff_std"]
+            )
+            pred_i[:, 2] = self.valid_dataset.denormalize(
+                pred_i[:, 2], stats["pressure_mean"], stats["pressure_std"]
+            )
+
+            loss = self.criterion(pred_i, graph.ndata["y"])
+            loss_valid_agg += loss.detach().cpu().numpy()
+
+            invar[:, 0:2] = self.valid_dataset.denormalize(
+                invar[:, 0:2], stats["velocity_mean"], stats["velocity_std"]
+            )
+
+            # do not update the "wall_boundary" & "outflow" nodes
+            mask = torch.cat((mask, mask), dim=-1).to(self.dist.device)
+            pred_i[:, 0:2] = torch.where(mask, pred_i[:, 0:2], torch.zeros_like(pred_i[:, 0:2]))
+
+            # integration
+            self.pred.append(torch.cat(((pred_i[:, 0:2] + invar[:, 0:2]), pred_i[:, [2]]), dim=-1).cpu())
+
+        # Don't need to store this beyond the vailidation
+        self.pred = []
+
+        loss_valid_agg /= len(self.valid_dataloader)
+
+        return loss_valid_agg
 
 def setup_config(wandb_config):
     constant = Constants(**wandb_config)
@@ -236,12 +267,6 @@ def main(project: Optional[str] = "modulus_gnn", entity: Optional[str] = "limiti
     DistributedManager.initialize()
     dist = DistributedManager()
 
-    if project is None:
-        project = "modulus_gnn"
-
-    if project is None:
-        entity = "limitingfactor"
-
     # initialize loggers
     run = initialize_wandb(
         project=project,
@@ -250,8 +275,6 @@ def main(project: Optional[str] = "modulus_gnn", entity: Optional[str] = "limiti
     )  # Wandb logger
 
     C = setup_config(wandb_config=run.config)
-    if kwargs["activation_fn"]:
-        C.activation_fn = kwargs["activation_fn"]
 
     # save constants to JSON file
     if dist.rank == 0:
@@ -269,15 +292,39 @@ def main(project: Optional[str] = "modulus_gnn", entity: Optional[str] = "limiti
     start = time.time()
     rank_zero_logger.info("Training started...")
     for epoch in range(trainer.epoch_init, C.epochs):
-        loss_agg = 0
-        for graph in trainer.dataloader:
+        rank_zero_logger.info(f"Training epoch {epoch}")
+
+        # Train the model
+        tmp_start = time.time()
+        loss_train_agg = 0
+        for graph in tqdm(trainer.dataloader):
             loss = trainer.train(graph)
-            loss_agg += loss.detach().cpu().numpy()
-        loss_agg /= len(trainer.dataloader)
+            loss_train_agg += loss.detach().cpu().numpy()
+        loss_train_agg /= len(trainer.dataloader)
+        time_per_epoch_train = (time.time() - tmp_start)
+
+        # Run the validation rollout
+        rank_zero_logger.info(f"Validating epoch {epoch}")
+        tmp_start = time.time()
+        loss_valid_agg = trainer.validation()
+        time_per_epoch_valid = (time.time() - tmp_start)
+
+        # Logging
+        time_per_epoch = (time.time() - start)
         rank_zero_logger.info(
-            f"epoch: {epoch}, loss: {loss_agg:10.3e}, time per epoch: {(time.time() - start):10.3e}"
+            f"epoch: {epoch}, "
+            f"loss/train: {loss_train_agg:10.3e}, "
+            f"loss/valid: {loss_valid_agg:10.3e}, "
+            f"time per epoch: {time_per_epoch:10.3e}"
         )
-        wb.log({"loss_train": loss_agg})
+        wb.log({
+            "loss/train": loss_train_agg,
+            "loss/valid": loss_valid_agg,
+            "learning rate": trainer.get_lr(),
+            "time_per_epoch/train": time_per_epoch_train,
+            "time_per_epoch/valid": time_per_epoch_valid,
+            "time_per_epoch/total": time_per_epoch
+        })
 
         # save checkpoint
         if dist.world_size > 1:
@@ -292,15 +339,18 @@ def main(project: Optional[str] = "modulus_gnn", entity: Optional[str] = "limiti
                 epoch=epoch,
             )
             logger.info(f"Saved model on rank {dist.rank}")
+
         start = time.time()
+
     rank_zero_logger.info("Training completed!")
 
 
 def get_options():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--entity", "-e", type=str, default=None)
     parser.add_argument("--project", "-p", type=str, default=None)
-    parser.add_argument("--activation_fn", type=str, default=None)
+
     args = parser.parse_args()
 
     return vars(args)

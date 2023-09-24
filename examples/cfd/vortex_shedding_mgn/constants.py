@@ -12,35 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from pathlib import Path
+from typing import Tuple
+
 from pydantic import BaseModel
-from typing import Tuple, Optional
 
 
 class Constants(BaseModel):
     """vortex shedding constants"""
 
+    # wb configs
+    wandb_mode: str = "online"
+    watch_model: bool = True
+
     # Model name
-    model_name: str = "test_2"
+    model_name: str = "training"
 
     # data configs
-    data_dir: str = "/home/swifta/modulus/datasets/cylinder_flow/cylinder_flow"
+    data_dir: str = "/datasets/cylinder_flow/cylinder_flow"
 
     # training configs
-    batch_size: int = 1
-    epochs: int = 25
-    num_training_samples: int = 1000
-    num_training_time_steps: int = 600
+    epochs: int = 5  # 25
+    training_batch_size: int = 11
+    num_training_samples: int = 22  # 1000
+    num_training_time_steps: int = 100  # 600
     training_noise_std: float = 0.02
 
-    num_valid_samples: int = 100
-    num_valid_time_steps: int = 600
+    valid_batch_size: int = 1 # Must be 1 for now
+    num_valid_samples: int = 4  # 100
+    num_valid_time_steps: int = 200  # 600
 
     lr: float = 0.0001
     lr_decay_rate: float = 0.9999991
-    ckpt_path: str = "checkpoints_test_3"
-    ckpt_name: str = "test_3.pt"
+    ckpt_path: str = "/workspace/checkpoints_training_5"
+    ckpt_name: str = "model.pt"
 
     # Mesh Graph Net Setup
     num_input_features: int = 6
@@ -59,7 +63,7 @@ class Constants(BaseModel):
     aggregation: str = "sum"
     do_concat_trick: bool = False
     num_processor_checkpoint_segments: int = 0
-    activation_fn: str = "silu"
+    activation_fn: str = "elu"
 
     # performance configs
     amp: bool = False
@@ -71,7 +75,3 @@ class Constants(BaseModel):
     viz_vars: Tuple[str, ...] = ("u", "v", "p")
     frame_skip: int = 10
     frame_interval: int = 1
-
-    # wb configs
-    wandb_mode: str = "online"
-    watch_model: bool = True
