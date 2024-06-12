@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 import torch
+import torch.nn as nn
 from dgl.dataloading import GraphDataLoader
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel
-import time, os
+
 import wandb as wb
 
 try:
@@ -65,7 +68,23 @@ class MGNTrainer:
 
         # instantiate the model
         self.model = MeshGraphNet(
-            C.num_input_features, C.num_edge_features, C.num_output_features
+            input_dim_nodes=C.num_input_features,
+            input_dim_edges=C.num_edge_features,
+            output_dim=C.num_output_features,
+            processor_size=C.processor_size,
+            num_layers_node_processor=C.num_layers_node_processor,
+            num_layers_edge_processor=C.num_layers_edge_processor,
+            hidden_dim_processor=C.hidden_dim_processor,
+            hidden_dim_node_encoder=C.hidden_dim_node_encoder,
+            num_layers_node_encoder=C.num_layers_node_encoder,
+            hidden_dim_edge_encoder=C.hidden_dim_edge_encoder,
+            num_layers_edge_encoder=C.num_layers_edge_encoder,
+            hidden_dim_node_decoder=C.hidden_dim_node_decoder,
+            num_layers_node_decoder=C.num_layers_node_decoder,
+            aggregation=C.aggregation,
+            do_concat_trick=C.do_concat_trick,
+            num_processor_checkpoint_segments=C.num_processor_checkpoint_segments,
+            activation_fn=C.activation_fn,
         )
         if C.jit:
             self.model = torch.jit.script(self.model).to(dist.device)
@@ -95,7 +114,7 @@ class MGNTrainer:
         except:
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=C.lr)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=lambda epoch: C.lr_decay_rate**epoch
+            self.optimizer, lr_lambda=lambda epoch: C.lr_decay_rate ** epoch
         )
         self.scaler = GradScaler()
 
@@ -146,17 +165,18 @@ if __name__ == "__main__":
     if dist.rank == 0:
         os.makedirs(C.ckpt_path, exist_ok=True)
         with open(
-            os.path.join(C.ckpt_path, C.ckpt_name.replace(".pt", ".json")), "w"
+                os.path.join(C.ckpt_path, C.ckpt_name.replace(".pt", ".json")), "w"
         ) as json_file:
             json_file.write(C.json(indent=4))
 
     # initialize loggers
     initialize_wandb(
-        project="Modulus-Launch",
-        entity="Modulus",
-        name="Vortex_Shedding-Training",
-        group="Vortex_Shedding-DDP-Group",
+        project="modulus_gnn",
+        entity="limitingfactor",
+        name="Vortex_Shedding-Training_2",
+        group=None,
         mode=C.wandb_mode,
+        config=C.__dict__
     )  # Wandb logger
     logger = PythonLogger("main")  # General python logger
     rank_zero_logger = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
@@ -169,7 +189,7 @@ if __name__ == "__main__":
         for graph in trainer.dataloader:
             loss = trainer.train(graph)
         rank_zero_logger.info(
-            f"epoch: {epoch}, loss: {loss:10.3e}, time per epoch: {(time.time()-start):10.3e}"
+            f"epoch: {epoch}, loss: {loss:10.3e}, time per epoch: {(time.time() - start):10.3e}"
         )
         wb.log({"loss": loss.detach().cpu()})
 
